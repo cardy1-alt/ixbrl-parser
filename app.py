@@ -1,10 +1,5 @@
 """
 PrivateHealthData.com - Companies House iXBRL Financial Parser
-Flask webhook that Make.com calls to extract financial figures from Companies House accounts.
-
-Endpoint: POST /parse
-Body: { "company_number": "05238658", "api_key": "your_ch_api_key" }
-Returns: JSON with extracted financial figures ready to push to Airtable
 """
 
 from flask import Flask, request, jsonify
@@ -15,71 +10,50 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# ── Companies House API base URLs ─────────────────────────────────────────────
 CH_API_BASE = "https://api.companieshouse.gov.uk"
 CH_DOC_API  = "https://document-api.companieshouse.gov.uk"
 
-# ── XBRL tag mappings ─────────────────────────────────────────────────────────
 FINANCIAL_TAGS = {
-    "turnover":                          "revenue",
-    "revenue":                           "revenue",
-    "turnoverorrevenue":                 "revenue",
-    "operatingprofit":                   "operating_profit",
-    "profitlossonordinaryactivities":    "operating_profit",
-    "profitlossbeforetax":               "profit_before_tax",
-    "profitbeforetax":                   "profit_before_tax",
-    "profitloss":                        "net_profit",
-    "profitlossforperiod":               "net_profit",
-    "depreciationtangibleassets":        "depreciation",
-    "amortisationintangibleassets":      "amortisation",
-    "netassets":                         "net_assets",
-    "netassetsliabilities":              "net_assets",
-    "totalnetassets":                    "net_assets",
-    "fixedassets":                       "fixed_assets",
-    "tangibleassets":                    "tangible_assets",
-    "currentassets":                     "current_assets",
-    "cashatbankandinhhand":              "cash",
-    "cash":                              "cash",
-    "creditors":                         "total_creditors",
-    "totalcreditors":                    "total_creditors",
-    "creditorswithinoneyear":            "short_term_creditors",
-    "creditorsduewithinoneyear":         "short_term_creditors",
-    "creditorsafteroneyear":             "long_term_creditors",
-    "creditorsdueafteroneyear":          "long_term_creditors",
-    "netdebt":                           "net_debt",
-    "shareholdersfunds":                 "shareholders_funds",
-    "equity":                            "shareholders_funds",
-    "calledupsharecapital":              "share_capital",
-    "averagenumberemployees":            "average_employees",
-    "averagenumberofemployees":          "average_employees",
+    "turnover": "revenue", "revenue": "revenue", "turnoverorrevenue": "revenue",
+    "operatingprofit": "operating_profit", "profitlossonordinaryactivities": "operating_profit",
+    "profitlossbeforetax": "profit_before_tax", "profitbeforetax": "profit_before_tax",
+    "profitloss": "net_profit", "profitlossforperiod": "net_profit",
+    "depreciationtangibleassets": "depreciation", "amortisationintangibleassets": "amortisation",
+    "netassets": "net_assets", "netassetsliabilities": "net_assets", "totalnetassets": "net_assets",
+    "fixedassets": "fixed_assets", "tangibleassets": "tangible_assets",
+    "currentassets": "current_assets", "cashatbankandinhhand": "cash", "cash": "cash",
+    "creditors": "total_creditors", "totalcreditors": "total_creditors",
+    "creditorswithinoneyear": "short_term_creditors", "creditorsduewithinoneyear": "short_term_creditors",
+    "creditorsafteroneyear": "long_term_creditors", "creditorsdueafteroneyear": "long_term_creditors",
+    "shareholdersfunds": "shareholders_funds", "equity": "shareholders_funds",
+    "averagenumberemployees": "average_employees", "averagenumberofemployees": "average_employees",
 }
 
 
 def get_filing_history(company_number, api_key):
     url = f"{CH_API_BASE}/company/{company_number}/filing-history"
-    params = {"category": "accounts", "items_per_page": 10}
-    resp = requests.get(url, auth=(api_key, ""), params=params, timeout=15)
+    resp = requests.get(url, auth=(api_key, ""), params={"category": "accounts", "items_per_page": 10}, timeout=15)
     if resp.status_code != 200:
-        return None
+        return None, f"Filing history HTTP {resp.status_code}"
     items = resp.json().get("items", [])
-    return items[0] if items else None
+    return (items[0], None) if items else (None, "No accounts filings found")
 
 
 def get_document_metadata(document_url, api_key):
     resp = requests.get(document_url, auth=(api_key, ""), timeout=15)
     if resp.status_code != 200:
-        return None
-    return resp.json()
+        return None, f"Metadata HTTP {resp.status_code}: {resp.text[:200]}"
+    return resp.json(), None
 
 
 def download_ixbrl(document_url, api_key):
     """
-    Download iXBRL document. Companies House returns a 302 redirect to S3.
-    Must follow redirect WITHOUT auth headers — S3 rejects signed requests with extra auth.
+    CH Document API returns 302 to S3. Must NOT send auth to S3.
     """
     content_url = f"{document_url}/content"
+    debug = {"content_url": content_url}
 
-    # First attempt: get redirect, then follow without auth
+    # Try 1: no-redirect, manual follow
     resp = requests.get(
         content_url,
         auth=(api_key, ""),
@@ -87,27 +61,31 @@ def download_ixbrl(document_url, api_key):
         timeout=30,
         allow_redirects=False,
     )
+    debug["try1_status"] = resp.status_code
+    debug["try1_headers"] = dict(resp.headers)
 
     if resp.status_code in (301, 302, 303, 307, 308):
         redirect_url = resp.headers.get("Location", "")
+        debug["redirect_url"] = redirect_url
         if redirect_url:
             s3_resp = requests.get(redirect_url, timeout=30)
+            debug["s3_status"] = s3_resp.status_code
             if s3_resp.status_code == 200:
-                return s3_resp.text
+                return s3_resp.text, debug
 
-    # Fallback: allow redirects automatically
-    for accept in ["application/xhtml+xml", "text/html", "*/*"]:
-        resp = requests.get(
-            content_url,
-            auth=(api_key, ""),
-            headers={"Accept": accept},
-            timeout=30,
-            allow_redirects=True,
-        )
-        if resp.status_code == 200 and resp.content:
-            return resp.text
+    # Try 2: auto-redirect with xhtml accept
+    resp2 = requests.get(content_url, auth=(api_key, ""), headers={"Accept": "application/xhtml+xml"}, timeout=30, allow_redirects=True)
+    debug["try2_status"] = resp2.status_code
+    if resp2.status_code == 200 and resp2.content:
+        return resp2.text, debug
 
-    return None
+    # Try 3: auto-redirect no accept header
+    resp3 = requests.get(content_url, auth=(api_key, ""), timeout=30, allow_redirects=True)
+    debug["try3_status"] = resp3.status_code
+    if resp3.status_code == 200 and resp3.content:
+        return resp3.text, debug
+
+    return None, debug
 
 
 def clean_numeric_value(raw):
@@ -145,13 +123,11 @@ def parse_ixbrl(html_content, balance_sheet_date=None):
             if known_tag in tag_name_clean:
                 value = clean_numeric_value(raw_value)
                 if value is not None:
-                    scale = tag.get("scale", "0")
                     try:
-                        value = value * (10 ** int(scale))
+                        value = value * (10 ** int(tag.get("scale", "0")))
                     except (ValueError, TypeError):
                         pass
-                    sign = tag.get("sign", "")
-                    if sign == "-":
+                    if tag.get("sign", "") == "-":
                         value = -abs(value)
                     if field_name not in results:
                         results[field_name] = value
@@ -164,9 +140,7 @@ def parse_ixbrl(html_content, balance_sheet_date=None):
 
     if "revenue" in results and results["revenue"] and results["revenue"] > 0:
         if "operating_profit" in results and results["operating_profit"] is not None:
-            results["operating_margin_pct"] = round(
-                (results["operating_profit"] / results["revenue"]) * 100, 2
-            )
+            results["operating_margin_pct"] = round((results["operating_profit"] / results["revenue"]) * 100, 2)
         ebitda = (results.get("operating_profit") or 0) + (results.get("depreciation") or 0) + (results.get("amortisation") or 0)
         if ebitda != 0:
             results["ebitda_estimate"] = ebitda
@@ -176,30 +150,28 @@ def parse_ixbrl(html_content, balance_sheet_date=None):
 
 
 def format_for_airtable(financial_data, company_number, filing_date):
-    def fmt(val):
-        return round(val) if val is not None else None
-
+    fmt = lambda val: round(val) if val is not None else None
     return {
-        "Companies House Number":  company_number,
-        "Accounts Filed Date":     filing_date,
-        "Balance Sheet Date":      financial_data.get("balance_sheet_date"),
-        "Revenue":                 fmt(financial_data.get("revenue")),
-        "Operating Profit":        fmt(financial_data.get("operating_profit")),
-        "Profit Before Tax":       fmt(financial_data.get("profit_before_tax")),
-        "Net Profit":              fmt(financial_data.get("net_profit")),
-        "EBITDA Estimate":         fmt(financial_data.get("ebitda_estimate")),
-        "EBITDA Margin %":         financial_data.get("ebitda_margin_pct"),
-        "Operating Margin %":      financial_data.get("operating_margin_pct"),
-        "Net Assets":              fmt(financial_data.get("net_assets")),
-        "Fixed Assets":            fmt(financial_data.get("fixed_assets")),
-        "Current Assets":          fmt(financial_data.get("current_assets")),
-        "Cash":                    fmt(financial_data.get("cash")),
-        "Total Creditors":         fmt(financial_data.get("total_creditors")),
-        "Short Term Creditors":    fmt(financial_data.get("short_term_creditors")),
-        "Long Term Creditors":     fmt(financial_data.get("long_term_creditors")),
-        "Shareholders Funds":      fmt(financial_data.get("shareholders_funds")),
-        "Average Employees":       financial_data.get("average_employees"),
-        "Last Financial Updated":  datetime.utcnow().strftime("%Y-%m-%d"),
+        "Companies House Number": company_number,
+        "Accounts Filed Date": filing_date,
+        "Balance Sheet Date": financial_data.get("balance_sheet_date"),
+        "Revenue": fmt(financial_data.get("revenue")),
+        "Operating Profit": fmt(financial_data.get("operating_profit")),
+        "Profit Before Tax": fmt(financial_data.get("profit_before_tax")),
+        "Net Profit": fmt(financial_data.get("net_profit")),
+        "EBITDA Estimate": fmt(financial_data.get("ebitda_estimate")),
+        "EBITDA Margin %": financial_data.get("ebitda_margin_pct"),
+        "Operating Margin %": financial_data.get("operating_margin_pct"),
+        "Net Assets": fmt(financial_data.get("net_assets")),
+        "Fixed Assets": fmt(financial_data.get("fixed_assets")),
+        "Current Assets": fmt(financial_data.get("current_assets")),
+        "Cash": fmt(financial_data.get("cash")),
+        "Total Creditors": fmt(financial_data.get("total_creditors")),
+        "Short Term Creditors": fmt(financial_data.get("short_term_creditors")),
+        "Long Term Creditors": fmt(financial_data.get("long_term_creditors")),
+        "Shareholders Funds": fmt(financial_data.get("shareholders_funds")),
+        "Average Employees": financial_data.get("average_employees"),
+        "Last Financial Updated": datetime.utcnow().strftime("%Y-%m-%d"),
     }
 
 
@@ -207,68 +179,66 @@ def format_for_airtable(financial_data, company_number, filing_date):
 def parse_company_accounts():
     data = request.get_json()
     if not data:
-        return jsonify({"error": "No JSON body provided"}), 400
+        return jsonify({"error": "No JSON body"}), 400
 
     company_number = data.get("company_number", "").strip().upper()
     api_key = data.get("api_key", "").strip()
+    debug_mode = data.get("debug", False)
 
     if not company_number:
-        return jsonify({"error": "company_number is required"}), 400
+        return jsonify({"error": "company_number required"}), 400
     if not api_key:
-        return jsonify({"error": "api_key is required"}), 400
+        return jsonify({"error": "api_key required"}), 400
 
-    filing = get_filing_history(company_number, api_key)
+    filing, err = get_filing_history(company_number, api_key)
     if not filing:
-        return jsonify({"error": "No accounts filing found", "company_number": company_number, "status": "no_filing"}), 404
+        return jsonify({"error": err, "status": "no_filing"}), 404
 
     filing_date = filing.get("date", "")
     links = filing.get("links", {})
     document_meta_url = links.get("document_metadata", "")
 
     if not document_meta_url:
-        return jsonify({"error": "No document metadata URL", "status": "no_document_url"}), 404
+        return jsonify({"error": "No document_metadata link in filing", "filing_keys": list(links.keys()), "status": "no_document_url"}), 404
 
     if document_meta_url.startswith("/"):
         document_meta_url = f"{CH_DOC_API}{document_meta_url}"
 
-    metadata = get_document_metadata(document_meta_url, api_key)
+    metadata, err = get_document_metadata(document_meta_url, api_key)
     if not metadata:
-        return jsonify({"error": "Could not retrieve document metadata", "status": "metadata_error"}), 500
+        return jsonify({"error": err, "status": "metadata_error"}), 500
 
     resources = metadata.get("resources", {})
-    if "application/xhtml+xml" not in resources and "application/xhtml" not in str(resources):
-        return jsonify({
-            "error": "No iXBRL format available — PDF only",
-            "available_formats": list(resources.keys()),
-            "filing_date": filing_date,
-            "status": "pdf_only"
-        }), 200
+    if "application/xhtml+xml" not in resources:
+        return jsonify({"error": "PDF only — no iXBRL", "available_formats": list(resources.keys()), "filing_date": filing_date, "status": "pdf_only"}), 200
 
     doc_links = metadata.get("links", {})
     document_url = doc_links.get("document", "")
-
     if not document_url:
-        return jsonify({"error": "No document download URL", "status": "no_download_url"}), 500
+        return jsonify({"error": "No document URL in metadata", "metadata_keys": list(doc_links.keys()), "status": "no_download_url"}), 500
 
-    html_content = download_ixbrl(document_url, api_key)
+    html_content, dl_debug = download_ixbrl(document_url, api_key)
     if not html_content:
-        return jsonify({"error": "Failed to download iXBRL document", "status": "download_error", "document_url": document_url}), 500
+        return jsonify({"error": "Failed to download iXBRL", "status": "download_error", "debug": dl_debug}), 500
 
     financial_data = parse_ixbrl(html_content, filing_date)
-
     if not financial_data:
-        return jsonify({"error": "No financial data extracted", "status": "parse_empty", "filing_date": filing_date}), 200
+        return jsonify({"error": "No data extracted", "status": "parse_empty"}), 200
 
     airtable_data = format_for_airtable(financial_data, company_number, filing_date)
 
-    return jsonify({
+    response = {
         "status": "success",
         "company_number": company_number,
         "filing_date": filing_date,
         "fields_extracted": len([v for v in financial_data.items() if v[1] is not None]),
         "airtable_data": airtable_data,
-        "raw_financial_data": financial_data
-    })
+        "raw_financial_data": financial_data,
+    }
+    if debug_mode:
+        response["download_debug"] = dl_debug
+
+    return jsonify(response)
 
 
 @app.route("/health", methods=["GET"])
