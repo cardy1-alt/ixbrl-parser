@@ -50,7 +50,7 @@ def download_ixbrl(document_url, api_key):
     """
     CH Document API returns 302 to S3. Must NOT send auth to S3.
     """
-    content_url = f"{document_url}/content"
+   content_url = document_url if document_url.endswith("/content") else f"{document_url}/content"
     debug = {"content_url": content_url}
 
     # Try 1: no-redirect, manual follow
